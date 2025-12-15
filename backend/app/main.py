@@ -6,10 +6,14 @@ import numpy as np
 from config import Config
 from .routes import router
 import logging
+from .database import init_db, get_db
+from .data_migration import run_migration
+from .admin_routes import router as admin_router
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -17,7 +21,18 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up Intelligent Road Accident Analysis Platform...")
     
-    # Load data and model
+    # Initialize database
+    try:
+        init_db()
+        logger.info("Database initialized")
+        
+        # Check if we need to load data (optional - you might want to run migration separately)
+        # run_migration()
+        
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+    
+    # Load ML model
     try:
         from .ml_model.model_training import AccidentPredictor
         app.state.predictor = AccidentPredictor()
@@ -52,6 +67,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(router, prefix="/api")
+app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
 
 @app.get("/")
 async def root():
@@ -59,12 +75,15 @@ async def root():
     return {
         "message": "Intelligent Road Accident Analysis Platform API",
         "version": "1.0.0",
+        "database": "SQLite",
         "endpoints": {
             "health": "/api/health",
             "predict": "/api/predict",
             "data_stats": "/api/data/stats",
             "hotspots": "/api/data/hotspots",
-            "features": "/api/data/features"
+            "features": "/api/data/features",
+            "database": "/api/db/stats",
+            "migrate": "/api/db/migrate"  # Optional endpoint to trigger migration
         }
     }
 
@@ -74,5 +93,6 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": app.state.predictor is not None,
+        "database": "initialized",
         "service": "Intelligent Road Accident Analysis Platform"
     }

@@ -23,13 +23,14 @@ logger = logging.getLogger(__name__)
 class AccidentPredictor:
     """Machine Learning model for accident severity prediction"""
     
-    def __init__(self, model_path: str = None, data_path: str = None):
+    def __init__(self, model_path: str = None, data_path: str = None, use_database: bool = True):
         self.model = None
         self.preprocessor = None
         self.label_encoder = None
         self.feature_names = []
         self.data = None
         self.metrics = {}
+        self.use_database = use_database  # Flag to use database or CSV
         
         # Configuration
         from config import Config
@@ -50,22 +51,26 @@ class AccidentPredictor:
             # Try to load existing model
             self.load_model()
             logger.info("Model loaded from saved files")
-        except:
+            
+            # Load data for inference/analysis
+            self.load_and_preprocess_data()
+            
+        except Exception as e:
             # Train new model if loading fails
-            logger.info("No saved model found. Training new model...")
+            logger.info(f"No saved model found or loading failed: {e}. Training new model...")
             self.load_and_preprocess_data()
             self.train_model()
             self.save_model()
     
     def load_and_preprocess_data(self):
-        """Load and preprocess the accident data"""
+        """Load and preprocess the accident data from database or CSV"""
         try:
-            # Load data
-            self.data = pd.read_csv(self.data_path)
-            
-            # Sample if data is too large
-            if len(self.data) > 100000:
-                self.data = self.data.sample(n=100000, random_state=42)
+            if self.use_database:
+                # Load from database
+                self._load_from_database()
+            else:
+                # Load from CSV (backward compatibility)
+                self._load_from_csv()
             
             logger.info(f"Loaded data with shape: {self.data.shape}")
             
@@ -77,31 +82,99 @@ class AccidentPredictor:
             # Create sample data for development
             self._create_sample_data()
     
+    def _load_from_database(self):
+        """Load data from database"""
+        try:
+            # Import here to avoid circular imports
+            from ..database import SessionLocal
+            from .. import crud
+            
+            db = SessionLocal()
+            crud_obj = crud.CRUD(db)
+            
+            # Get all accidents (consider limiting for large datasets)
+            accidents = crud_obj.get_accidents(limit=100000)  # Limit for training
+            
+            if not accidents:
+                logger.warning("No data in database. Falling back to CSV.")
+                self._load_from_csv()
+                db.close()
+                return
+            
+            # Convert to DataFrame
+            data_dicts = []
+            for accident in accidents:
+                data_dicts.append({
+                    'severity': accident.severity,
+                    'longitude': accident.longitude,
+                    'latitude': accident.latitude,
+                    'accident_date': accident.accident_date,
+                    'accident_time': accident.accident_time,
+                    'weather_conditions': accident.weather_conditions,
+                    'light_conditions': accident.light_conditions,
+                    'road_type': accident.road_type,
+                    'speed_limit': accident.speed_limit,
+                    'road_surface_conditions': accident.road_surface_conditions,
+                    'junction_detail': accident.junction_detail,
+                    'urban_or_rural_area': accident.urban_or_rural_area,
+                    'year': accident.year,
+                    'month': accident.month,
+                    'day': accident.day,
+                    'hour': accident.hour,
+                    'day_of_week': accident.day_of_week,
+                    'is_weekend': accident.is_weekend,
+                    'time_of_day': accident.time_of_day
+                })
+            
+            self.data = pd.DataFrame(data_dicts)
+            
+            db.close()
+            logger.info(f"Loaded {len(self.data)} records from database")
+            
+        except Exception as e:
+            logger.error(f"Failed to load from database: {e}")
+            raise
+    
+    def _load_from_csv(self):
+        """Load data from CSV file"""
+        try:
+            self.data = pd.read_csv(self.data_path)
+            
+            # Sample if data is too large
+            if len(self.data) > 100000:
+                self.data = self.data.sample(n=100000, random_state=42)
+                logger.info(f"Sampled data to {len(self.data)} records")
+                
+        except Exception as e:
+            logger.error(f"Failed to load from CSV: {e}")
+            raise
+    
     def _preprocess_data(self):
         """Preprocess the accident data"""
-        # Rename columns to standard format
-        column_mapping = {
-            'Accident_Severity': 'severity',
-            'Longitude': 'longitude',
-            'Latitude': 'latitude',
-            'Date': 'accident_date',
-            'Time': 'accident_time',
-            'Weather_Conditions': 'weather_conditions',
-            'Light_Conditions': 'light_conditions',
-            'Road_Type': 'road_type',
-            'Speed_limit': 'speed_limit',
-            'Road_Surface_Conditions': 'road_surface_conditions',
-            'Junction_Detail': 'junction_detail',
-            'Urban_or_Rural_Area': 'urban_or_rural_area'
-        }
-        
-        # Rename columns that exist
-        self.data = self.data.rename(columns={
-            k: v for k, v in column_mapping.items() if k in self.data.columns
-        })
+        # Rename columns to standard format if needed
+        if 'Accident_Index' in self.data.columns:
+            column_mapping = {
+                'Accident_Severity': 'severity',
+                'Longitude': 'longitude',
+                'Latitude': 'latitude',
+                'Date': 'accident_date',
+                'Time': 'accident_time',
+                'Weather_Conditions': 'weather_conditions',
+                'Light_Conditions': 'light_conditions',
+                'Road_Type': 'road_type',
+                'Speed_limit': 'speed_limit',
+                'Road_Surface_Conditions': 'road_surface_conditions',
+                'Junction_Detail': 'junction_detail',
+                'Urban_or_Rural_Area': 'urban_or_rural_area'
+            }
+            
+            # Rename columns that exist
+            self.data = self.data.rename(columns={
+                k: v for k, v in column_mapping.items() if k in self.data.columns
+            })
         
         # Ensure required columns exist
-        required_columns = ['severity', 'longitude', 'latitude', 'accident_date']
+        required_columns = ['severity', 'longitude', 'latitude']
         for col in required_columns:
             if col not in self.data.columns:
                 raise ValueError(f"Required column {col} not found in data")
@@ -121,23 +194,40 @@ class AccidentPredictor:
             self.data['severity'] = self.data['severity'].map(severity_mapping)
             self.data = self.data[self.data['severity'].notna()]
         
-        # Extract features from date and time
-        if 'accident_date' in self.data.columns:
-            self.data['accident_date'] = pd.to_datetime(self.data['accident_date'], errors='coerce')
+        # Process date if it exists and is not already processed
+        if 'accident_date' in self.data.columns and 'year' not in self.data.columns:
+            if isinstance(self.data['accident_date'].iloc[0], str):
+                self.data['accident_date'] = pd.to_datetime(self.data['accident_date'], errors='coerce')
+            
             self.data['year'] = self.data['accident_date'].dt.year
             self.data['month'] = self.data['accident_date'].dt.month
             self.data['day'] = self.data['accident_date'].dt.day
             self.data['day_of_week'] = self.data['accident_date'].dt.dayofweek
             self.data['is_weekend'] = self.data['day_of_week'].isin([5, 6]).astype(int)
         
-        if 'accident_time' in self.data.columns:
-            # Convert time to hour
-            self.data['accident_time'] = pd.to_datetime(self.data['accident_time'], format='%H:%M', errors='coerce').dt.hour
-            self.data['hour'] = self.data['accident_time'].fillna(12)
+        # Process time if it exists and is not already processed
+        if 'accident_time' in self.data.columns and 'hour' not in self.data.columns:
+            if isinstance(self.data['accident_time'].iloc[0], str):
+                # Convert time string to hour
+                try:
+                    self.data['hour'] = pd.to_datetime(
+                        self.data['accident_time'], format='%H:%M', errors='coerce'
+                    ).dt.hour
+                except:
+                    self.data['hour'] = 12
+            elif hasattr(self.data['accident_time'].iloc[0], 'hour'):
+                # Already a time object
+                self.data['hour'] = self.data['accident_time'].apply(lambda x: x.hour if x else 12)
+            else:
+                self.data['hour'] = 12
+        
+        # Create time_of_day if not exists
+        if 'hour' in self.data.columns and 'time_of_day' not in self.data.columns:
             self.data['time_of_day'] = pd.cut(
                 self.data['hour'], 
                 bins=[0, 6, 12, 18, 24], 
-                labels=['Night', 'Morning', 'Afternoon', 'Evening']
+                labels=['Night', 'Morning', 'Afternoon', 'Evening'],
+                include_lowest=True
             )
         
         # Handle missing values
@@ -179,6 +269,11 @@ class AccidentPredictor:
         self.data['hour'] = np.random.randint(0, 24, n_samples)
         self.data['day_of_week'] = np.random.randint(0, 7, n_samples)
         self.data['is_weekend'] = (self.data['day_of_week'] >= 5).astype(int)
+        self.data['time_of_day'] = pd.cut(
+            self.data['hour'], 
+            bins=[0, 6, 12, 18, 24], 
+            labels=['Night', 'Morning', 'Afternoon', 'Evening']
+        )
         
         logger.info("Created sample data for development")
     
@@ -214,20 +309,6 @@ class AccidentPredictor:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
         )
-        
-        # Define preprocessing
-        numeric_features = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
-        categorical_features = X.select_dtypes(include=['object']).columns.tolist()
-        
-        numeric_transformer = Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler())
-        ])
-        
-        categorical_transformer = Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-            ('onehot', pd.get_dummies)  # We'll handle this differently
-        ])
         
         # For simplicity, we'll use pandas get_dummies
         X_train_processed = pd.get_dummies(X_train, columns=categorical_features)
@@ -426,11 +507,12 @@ class AccidentPredictor:
                 options[col] = self.data[col].dropna().unique().tolist()
         
         # Add numeric ranges
-        options['speed_limit'] = {
-            'min': int(self.data['speed_limit'].min()),
-            'max': int(self.data['speed_limit'].max()),
-            'common_values': [30, 40, 50, 60, 70]
-        }
+        if 'speed_limit' in self.data.columns:
+            options['speed_limit'] = {
+                'min': int(self.data['speed_limit'].min()),
+                'max': int(self.data['speed_limit'].max()),
+                'common_values': [30, 40, 50, 60, 70]
+            }
         
         return options
     
@@ -438,11 +520,12 @@ class AccidentPredictor:
         """Get accident hotspots"""
         df = self.data.copy()
         
-        # Filter by date
-        if min_date:
-            df = df[df['accident_date'] >= pd.to_datetime(min_date)]
-        if max_date:
-            df = df[df['accident_date'] <= pd.to_datetime(max_date)]
+        # Filter by date if date column exists
+        if 'accident_date' in df.columns:
+            if min_date:
+                df = df[df['accident_date'] >= pd.to_datetime(min_date)]
+            if max_date:
+                df = df[df['accident_date'] <= pd.to_datetime(max_date)]
         
         # Filter by severity
         if severity_filter:
@@ -518,8 +601,8 @@ class AccidentPredictor:
             with open(self.features_path, 'w') as f:
                 json.dump({
                     'feature_names': self.feature_names,
-                    'categorical_columns': self.preprocessor['categorical_columns'],
-                    'label_classes': self.label_encoder.classes_.tolist()
+                    'categorical_columns': self.preprocessor['categorical_columns'] if self.preprocessor else [],
+                    'label_classes': self.label_encoder.classes_.tolist() if self.label_encoder else []
                 }, f)
             
             logger.info(f"Model saved to {self.model_path}")
@@ -541,7 +624,8 @@ class AccidentPredictor:
             
             # Create label encoder
             self.label_encoder = LabelEncoder()
-            self.label_encoder.classes_ = np.array(preprocessor_info['label_classes'])
+            if 'label_classes' in preprocessor_info and preprocessor_info['label_classes']:
+                self.label_encoder.classes_ = np.array(preprocessor_info['label_classes'])
             
             logger.info(f"Model loaded from {self.model_path}")
             
